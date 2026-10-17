@@ -2,6 +2,21 @@
 
 递归扫描一个照片目录，从 EXIF 统计拍摄习惯：机身、镜头、焦距、光圈、ISO、快门、拍摄时间、横竖构图，以及长焦和 35mm 两个专题。
 
+## 安装
+
+整个工具只有一个脚本 `photo_habits.py`，任选一种方式拿到它：
+
+```bash
+git clone https://github.com/nightfade/photo-habits.git
+cd photo-habits
+```
+
+或者只下载这一个文件：
+
+```bash
+curl -O https://raw.githubusercontent.com/nightfade/photo-habits/main/photo_habits.py
+```
+
 ## 依赖
 
 - Python 3.8+，只用标准库
