@@ -1,5 +1,7 @@
 # photo-habits
 
+> **本项目已并入 [LightTable](https://github.com/nightfade/LightTable)，不再更新。** 拍摄习惯统计在 LightTable 里继续维护，报告改为网页，不再需要 Python 和 PyTorch。这里的脚本保留作存档。
+
 递归扫描一个照片目录，从 EXIF 统计拍摄习惯：机身、镜头、焦距、光圈、ISO、快门、拍摄时间、横竖构图，以及长焦和 35mm 两个专题。每张照片还会按内容分成人像、街头、风景、城市建筑、动物、静物，对比不同题材下的拍摄习惯。
 
 ## 安装
