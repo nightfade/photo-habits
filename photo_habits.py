@@ -22,10 +22,19 @@ Photo Habits — 递归扫描照片目录，从 EXIF 统计拍摄习惯。
   - Lightroom / Photoshop 等软件导出的 JPEG 默认排除（--include-exports 可保留）
   - 手机照片计入「机身」统计，但默认不进习惯分析（--include-phones 可保留）
   - Bridge / Lightroom 写在 .xmp 旁车文件里的星级会合并进来
+
+内容分类（人像、街头、风景、城市建筑、动物、静物、其他）：
+  - 依次看 关键词 → 目录名 → 本地 CLIP 模型看图 → 相机场景模式与人脸检测
+  - CLIP 是可选依赖：pip install open_clip_torch pillow（HEIC 另需 pillow-heif），
+    首次运行下载约 600MB 模型；没装时只用元数据，判断不了的记为「未分类」
+  - 看图结果缓存在 content_cache.json，重算报告不会重新看图
 """
 
 import argparse
+import base64
 import csv
+import hashlib
+import io
 import json
 import os
 import re
@@ -60,7 +69,10 @@ TAGS = [
     "-WhiteBalance", "-DateTimeOriginal", "-SubSecTimeOriginal",
     "-ImageWidth#", "-ImageHeight#", "-Orientation#",
     "-Software", "-CreatorTool", "-Rating#", "-Label",
+    "-Subject", "-HierarchicalSubject", "-Keywords", "-PersonInImage", "-RegionType",
+    "-SceneCaptureType", "-SceneMode", "-FacesDetected",
 ]
+SIDECAR_TAGS = ["-Rating#", "-Label", "-Subject", "-HierarchicalSubject", "-PersonInImage", "-RegionType"]
 BATCH = 400
 
 
@@ -93,25 +105,35 @@ def walk(root, exclude_dirs):
     return images, sidecars
 
 
+def exiftool_json(exiftool, paths, tags):
+    """对一批文件跑 exiftool -j，解析失败返回 None。"""
+    with tempfile.NamedTemporaryFile("w", suffix=".args", delete=False, encoding="utf-8") as f:
+        f.write("\n".join(paths))
+        argfile = f.name
+    try:
+        cmd = [exiftool, "-charset", "filename=utf8", "-j", "-q", "-q",
+               "-api", "largefilesupport=1", *tags, "-@", argfile]
+        r = subprocess.run(cmd, capture_output=True)
+        text = r.stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            return []
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    finally:
+        os.unlink(argfile)
+
+
 def run_exiftool(exiftool, paths, tags):
     out = []
     for i in range(0, len(paths), BATCH):
         chunk = paths[i:i + BATCH]
-        with tempfile.NamedTemporaryFile("w", suffix=".args", delete=False, encoding="utf-8") as f:
-            f.write("\n".join(chunk))
-            argfile = f.name
-        try:
-            cmd = [exiftool, "-charset", "filename=utf8", "-j", "-q", "-q",
-                   "-api", "largefilesupport=1", *tags, "-@", argfile]
-            r = subprocess.run(cmd, capture_output=True)
-            text = r.stdout.decode("utf-8", errors="replace").strip()
-            if text:
-                try:
-                    out.extend(json.loads(text))
-                except json.JSONDecodeError:
-                    print(f"  警告：第 {i}–{i + len(chunk)} 个文件的结果解析失败，已跳过", file=sys.stderr)
-        finally:
-            os.unlink(argfile)
+        res = exiftool_json(exiftool, chunk, tags)
+        if res is None:
+            print(f"  警告：第 {i}–{i + len(chunk)} 个文件的结果解析失败，已跳过", file=sys.stderr)
+        else:
+            out.extend(res)
         done = min(i + BATCH, len(paths))
         print(f"\r  已读取 {done}/{len(paths)}", end="", file=sys.stderr, flush=True)
     print(file=sys.stderr)
@@ -123,7 +145,7 @@ def scan(root, exiftool, exclude_dirs):
     images, sidecars = walk(root, exclude_dirs)
     print(f"找到 {len(images)} 个图片文件、{len(sidecars)} 个 .xmp 旁车文件", file=sys.stderr)
     data = run_exiftool(exiftool, images, TAGS)
-    side = run_exiftool(exiftool, sidecars, ["-Rating#", "-Label"]) if sidecars else []
+    side = run_exiftool(exiftool, sidecars, SIDECAR_TAGS) if sidecars else []
     return {"root": os.path.abspath(root), "images": data, "sidecars": side}
 
 
@@ -186,6 +208,26 @@ def lens_name(d, body):
     return f"{body} 内置/未知镜头"
 
 
+def text_list(v):
+    """关键词类 tag 可能是字符串也可能是列表；层级关键词按 | 拆开。"""
+    items = v if isinstance(v, list) else [v] if v not in (None, "") else []
+    out = []
+    for x in items:
+        out += [p.strip() for p in str(x).split("|") if p.strip()]
+    return out
+
+
+def keywords_of(d):
+    return text_list(d.get("Subject")) + text_list(d.get("HierarchicalSubject")) + text_list(d.get("Keywords"))
+
+
+def faces_of(d):
+    """相机人脸检测数、Lightroom 人脸区域、人物标注，取最大值。"""
+    n = max((int(x) for x in re.findall(r"\d+", text(d.get("FacesDetected")))), default=0)
+    n = max(n, sum(1 for t in text_list(d.get("RegionType")) if t.lower() == "face"))
+    return max(n, len(text_list(d.get("PersonInImage"))))
+
+
 def parse_time(s):
     s = text(s)
     for fmt in ("%Y:%m:%d %H:%M:%S", "%Y:%m:%d %H:%M"):
@@ -200,7 +242,7 @@ def build_records(cache, include_exports, include_phones):
     ratings = {}
     for d in cache.get("sidecars", []):
         r = num(g(d, "Rating"))
-        ratings[stem_key(d.get("SourceFile", ""))] = (r, text(d.get("Label")))
+        ratings[stem_key(d.get("SourceFile", ""))] = (r, text(d.get("Label")), keywords_of(d), faces_of(d))
 
     stats = Counter()
     candidates = {}
@@ -221,7 +263,7 @@ def build_records(cache, include_exports, include_phones):
         body = body_name(make, model)
         t = parse_time(d.get("DateTimeOriginal"))
         sk = stem_key(path)
-        sidecar_rating, sidecar_label = ratings.get(sk, (None, ""))
+        sidecar_rating, sidecar_label, sidecar_kw, sidecar_faces = ratings.get(sk, (None, "", [], 0))
         rating = num(g(d, "Rating"))
         if sidecar_rating is not None:
             rating = sidecar_rating if rating is None else max(rating, sidecar_rating)
@@ -258,6 +300,10 @@ def build_records(cache, include_exports, include_phones):
             "flash": None if flash is None else bool(int(flash) & 1),
             "portrait": portrait, "rating": rating,
             "label": text(d.get("Label")) or sidecar_label, "export": is_export,
+            "orient": orient, "keywords": keywords_of(d) + sidecar_kw,
+            "faces": max(faces_of(d), sidecar_faces),
+            "scene": f"{text(d.get('SceneCaptureType'))} {text(d.get('SceneMode'))}".strip(),
+            "category": None, "category_src": "", "category_conf": None,
         }
         if t:
             key = (body, t.isoformat(), text(d.get("SubSecTimeOriginal")), sk[1])
@@ -271,11 +317,242 @@ def build_records(cache, include_exports, include_phones):
             keep, drop = (rec, old) if rec["raw"] and not old["raw"] else (old, rec)
             if drop["rating"] is not None:
                 keep["rating"] = drop["rating"] if keep["rating"] is None else max(keep["rating"], drop["rating"])
+            keep["keywords"] += [k for k in drop["keywords"] if k not in keep["keywords"]]
+            keep["faces"] = max(keep["faces"], drop["faces"])
             candidates[key] = keep
 
     allrecs = list(candidates.values())
     habit = allrecs if include_phones else [r for r in allrecs if not r["phone"]]
     return allrecs, habit, stats
+
+
+# ---------------------------------------------------------------- 内容分类
+
+# (类别, 关键词与目录名别名, CLIP 提示词)。别名不分大小写，英文按整词匹配，中文按子串匹配。
+# 一张照片命中多个类别时取靠前的，所以「人像」排在「风景」前面（环境人像算人像）。
+CATEGORIES = [
+    ("人像", ["人像", "肖像", "写真", "合影", "孩子", "宝宝", "家人",
+            "portrait", "portraits", "people", "family", "kids", "baby"],
+     ["a portrait photo of a person", "a close-up photo of a person's face", "a photo of a child",
+      "a photo of a family posing together", "a photo of a kid playing"]),
+    ("街头", ["街拍", "街头", "扫街", "人文", "street", "streets", "candid"],
+     ["a candid street photograph of strangers", "people walking in a crowd on a city sidewalk",
+      "a photo of a street vendor", "a photo of a crowded market"]),
+    ("风景", ["风景", "风光", "自然", "landscape", "landscapes", "scenery", "nature"],
+     ["a landscape photo of mountains", "a photo of the sea and the coastline", "a photo of a forest",
+      "a scenic view of nature under the sky", "a photo of a lake at sunset",
+      "a wide view of open countryside with hills and fields", "a photo inside a cave or a canyon"]),
+    ("城市建筑", ["建筑", "城市", "architecture", "cityscape", "urban", "buildings"],
+     ["a photo of a building facade", "architecture photography", "a photo of a city skyline",
+      "a photo of a city street lined with buildings", "a city at night with neon signs",
+      "a photo of the interior of a church or a museum"]),
+    ("动物", ["动物", "鸟类", "宠物", "猫咪", "狗狗", "animal", "animals", "wildlife",
+            "bird", "birds", "pet", "pets", "cat", "cats", "dog", "dogs"],
+     ["a close-up photo of a dog", "a close-up photo of a cat", "a photo of a bird",
+      "a wildlife photo of an animal"]),
+    ("静物", ["静物", "美食", "食物", "微距", "花卉", "still life", "food", "macro", "product"],
+     ["a photo of food on a table", "a close-up photo of an object", "a still life photo",
+      "a close-up photo of flowers"]),
+    ("其他", [], ["a photo of a document or a screen", "a blurry out of focus photo"]),
+]
+CATEGORY_NAMES = [c[0] for c in CATEGORIES] + ["未分类"]
+CLIP_MODEL = ("ViT-B-32", "laion2b_s34b_b79k")
+CLIP_MIN_PROB = 0.4  # 看图时最高的类别概率低于这个值，归入「其他」
+CLIP_BATCH = 16
+
+
+def alias_hits(s):
+    s = s.lower()
+    hits = []
+    for name, aliases, _ in CATEGORIES:
+        for a in aliases:
+            if (a in s) if not a.isascii() else re.search(rf"(?<![a-z]){re.escape(a)}(?![a-z])", s):
+                hits.append(name)
+                break
+    return hits
+
+
+def first_in_order(names):
+    return next((c for c in CATEGORY_NAMES if c in names), None)
+
+
+def classify_by_tags(r, root):
+    """使用者自己给的信号：关键词优先，其次是照片所在的目录名（越深的目录越优先）。"""
+    hit = first_in_order({c for k in r["keywords"] for c in alias_hits(k)})
+    if hit:
+        return hit, "关键词"
+    d = os.path.abspath(os.path.dirname(r["path"]))  # 只看根目录以下，根目录自己的名字不算
+    if root and os.path.normcase(d).startswith(os.path.normcase(root)):
+        d = d[len(root):]
+    for part in reversed(re.split(r"[\\/]", d)):
+        hit = first_in_order(alias_hits(part))
+        if hit:
+            return hit, "目录名"
+    return None, ""
+
+
+def classify_by_camera(r):
+    """看不了图时的兜底：相机场景模式，其次是人脸检测（街拍也会检测到人脸，只能当人像算）。"""
+    scene = r["scene"].lower()
+    if "portrait" in scene:
+        return "人像", "相机场景模式"
+    if "landscape" in scene or "scenery" in scene:
+        return "风景", "相机场景模式"
+    if r["faces"]:
+        return "人像", "人脸检测"
+    return "未分类", ""
+
+
+ROTATE = {3: 180, 6: 270, 8: 90}
+
+
+def load_images(recs, exiftool):
+    """返回与 recs 一一对应的 RGB 图像，读不出来的为 None。
+    RAW 和 PIL 打不开的格式用 exiftool 抽内嵌预览图，只解码到够 CLIP 用的尺寸。"""
+    from PIL import Image, ImageOps
+    out = [None] * len(recs)
+    need = []
+    for i, r in enumerate(recs):
+        if r["raw"]:
+            need.append(i)
+            continue
+        try:
+            im = Image.open(r["path"])
+            im.draft("RGB", (448, 448))
+            out[i] = ImageOps.exif_transpose(im).convert("RGB")
+        except Exception:
+            need.append(i)
+    if need and exiftool:
+        tags = ["-b", "-PreviewImage", "-JpgFromRaw", "-OtherImage", "-ThumbnailImage"]
+        res = exiftool_json(exiftool, [recs[i]["path"] for i in need], tags) or []
+        by_path = {os.path.normcase(d.get("SourceFile", "")): d for d in res}
+        for i in need:
+            d = by_path.get(os.path.normcase(recs[i]["path"]), {})
+            blobs = [v for k, v in d.items() if isinstance(v, str) and v.startswith("base64:")]
+            if not blobs:
+                continue
+            try:
+                im = Image.open(io.BytesIO(base64.b64decode(max(blobs, key=len)[7:])))
+                im.draft("RGB", (448, 448))
+                im = im.convert("RGB")
+                angle = ROTATE.get(int(recs[i]["orient"] or 1))
+                out[i] = im.rotate(angle, expand=True) if angle else im
+            except Exception:
+                continue
+    return out
+
+
+class ClipClassifier:
+    def __init__(self):
+        import open_clip
+        import torch
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except ImportError:
+            pass
+        self.torch = torch
+        self.device = ("cuda" if torch.cuda.is_available()
+                       else "mps" if torch.backends.mps.is_available() else "cpu")
+        print(f"加载 CLIP 模型 {CLIP_MODEL[0]}（首次运行会下载约 600MB）…", file=sys.stderr)
+        model, _, self.preprocess = open_clip.create_model_and_transforms(
+            CLIP_MODEL[0], pretrained=CLIP_MODEL[1], device=self.device)
+        self.model = model.eval()
+        tokenizer = open_clip.get_tokenizer(CLIP_MODEL[0])
+        with torch.no_grad():
+            feats = []
+            for _, _, prompts in CATEGORIES:  # 同一类的多条提示词取平均
+                f = self.model.encode_text(tokenizer(prompts).to(self.device))
+                f = (f / f.norm(dim=-1, keepdim=True)).mean(dim=0)
+                feats.append(f / f.norm())
+            self.text = torch.stack(feats)
+
+    def probs(self, images):
+        torch = self.torch
+        with torch.no_grad():
+            x = torch.stack([self.preprocess(im) for im in images]).to(self.device)
+            f = self.model.encode_image(x)
+            f = f / f.norm(dim=-1, keepdim=True)
+            p = (100.0 * f @ self.text.T).softmax(dim=-1).cpu().tolist()
+        return [{c[0]: round(v, 4) for c, v in zip(CATEGORIES, row)} for row in p]
+
+
+def clip_signature():
+    return hashlib.sha1(json.dumps([CLIP_MODEL, [c[2] for c in CATEGORIES]]).encode()).hexdigest()[:12]
+
+
+def classify_by_clip(recs, cache_path, exiftool, required):
+    """看图分类，结果按文件路径和修改时间缓存。返回是否用上了 CLIP。"""
+    cache = {}
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+    if cache.get("signature") != clip_signature():
+        cache = {"signature": clip_signature(), "photos": {}}
+    photos = cache["photos"]
+
+    def mtime(path):
+        try:
+            return round(os.path.getmtime(path))
+        except OSError:
+            return None  # 原图不在了（只用缓存重算），沿用旧结果
+
+    todo = []
+    for r in recs:
+        hit = photos.get(r["path"])
+        m = mtime(r["path"])
+        if hit and (m is None or hit["mtime"] == m):
+            r["_probs"] = hit["probs"]
+        elif m is not None:
+            todo.append(r)
+
+    clf = None
+    if todo:
+        try:
+            clf = ClipClassifier()
+        except ImportError:
+            if required:
+                sys.exit("--content clip 需要 CLIP：pip install open_clip_torch pillow")
+            print("未安装 open_clip，内容分类只用元数据。pip install open_clip_torch pillow 可启用看图分类",
+                  file=sys.stderr)
+    if clf:
+        for i in range(0, len(todo), CLIP_BATCH):
+            chunk = todo[i:i + CLIP_BATCH]
+            imgs = load_images(chunk, exiftool)
+            ok = [(r, im) for r, im in zip(chunk, imgs) if im is not None]
+            if ok:
+                for (r, _), p in zip(ok, clf.probs([im for _, im in ok])):
+                    r["_probs"] = p
+                    photos[r["path"]] = {"mtime": mtime(r["path"]), "probs": p}
+            done = min(i + CLIP_BATCH, len(todo))
+            print(f"\r  看图分类 {done}/{len(todo)}", end="", file=sys.stderr, flush=True)
+            if done % (CLIP_BATCH * 50) == 0 or done == len(todo):  # 中途中断也能保住进度
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False)
+        print(file=sys.stderr)
+
+    used = False
+    for r in recs:
+        p = r.pop("_probs", None)
+        if p is None:
+            continue
+        best = max(p, key=p.get)
+        r["category"] = best if p[best] >= CLIP_MIN_PROB else "其他"
+        r["category_src"], r["category_conf"] = "CLIP", p[best]
+        used = True
+    return used
+
+
+def classify_content(recs, root, mode, cache_path, exiftool):
+    """给每条记录填 category / category_src。返回是否用上了 CLIP。"""
+    for r in recs:
+        r["category"], r["category_src"] = classify_by_tags(r, root)
+    rest = [r for r in recs if r["category"] is None]
+    used = mode != "meta" and bool(rest) and classify_by_clip(rest, cache_path, exiftool, mode == "clip")
+    for r in rest:
+        if r["category"] is None:
+            r["category"], r["category_src"] = classify_by_camera(r)
+    return used
 
 
 # ---------------------------------------------------------------- 报告工具
@@ -317,6 +594,25 @@ def rng(lo, hi):
     return lambda v: lo <= v < hi
 
 
+def crosstab(title_col, groups, value_fn, buckets):
+    """groups: [(名称, recs)]。每格是该组里落入该桶的比例，表头括号里是有该数据的张数。"""
+    cols, counts = [], []
+    for name, recs in groups:
+        c, have = Counter(), 0
+        for r in recs:
+            v = value_fn(r)
+            if v is None:
+                continue
+            have += 1
+            label = next((label for label, test in buckets if test(v)), None)
+            if label:
+                c[label] += 1
+        cols.append(f"{name}({have})")
+        counts.append((c, have))
+    rows = [[label] + [pct(c[label], have) if c[label] else "" for c, have in counts] for label, _ in buckets]
+    return table([title_col] + cols, rows)
+
+
 def fmt_shutter(s):
     if s is None:
         return "—"
@@ -349,7 +645,7 @@ def rated(r):
 
 # ---------------------------------------------------------------- 报告各节
 
-def section_overview(allrecs, habit, stats, root, include_phones):
+def section_overview(allrecs, habit, stats, root, include_phones, categories=None):
     times = [r["time"] for r in allrecs if r["time"]]
     days = {t.date() for t in times}
     lines = ["## 概览", ""]
@@ -357,6 +653,8 @@ def section_overview(allrecs, habit, stats, root, include_phones):
     rows += [("去重后照片", len(allrecs)),
              ("其中手机", sum(r["phone"] for r in allrecs)),
              ("进入习惯分析" + ("（含手机）" if include_phones else "（不含手机）"), len(habit)),
+             *([("只看类别", f"{'、'.join(categories)}：{sum(r['category'] in categories for r in habit)} 张")]
+               if categories else []),
              ("拍摄天数", len(days))]
     if times:
         rows.append(("时间跨度", f"{min(times):%Y-%m-%d} 至 {max(times):%Y-%m-%d}"))
@@ -391,6 +689,51 @@ def section_bodies(allrecs):
             c = Counter(r["body"] for r in allrecs if r["time"] and r["time"].year == y)
             rows.append([y, sum(c.values())] + [c.get(b, "") for b in top])
         lines += ["### 每年各机身张数", "", table(["年份", "合计"] + top, rows), ""]
+    return lines
+
+
+def section_content(habit, lens_min, clip_used):
+    by = defaultdict(list)
+    for r in habit:
+        by[r["category"]].append(r)
+    cats = sorted(by, key=lambda c: (-len(by[c]), CATEGORY_NAMES.index(c)))
+    lines = ["## 照片内容", ""]
+
+    src = Counter(r["category_src"] or "无可用信号" for r in habit)
+    lines += ["### 分类依据", "",
+              "按 关键词 → 目录名 → CLIP 看图 → 相机场景模式 / 人脸检测 的顺序，用第一个有结果的。", "",
+              table(["依据", "张数", "占比"], [(k, v, pct(v, len(habit))) for k, v in src.most_common()]), ""]
+    if not clip_used:
+        lines += ["> 这次没有看图分类（未安装 open_clip 或用了 --content meta），"
+                  "「人脸检测」会把有人的街拍也算成人像，判断不了的记为「未分类」。", ""]
+    elif "其他" in by:
+        lines += [f"> CLIP 最高的类别概率低于 {CLIP_MIN_PROB:.0%} 的照片归入「其他」。", ""]
+
+    rows = []
+    for c in cats:
+        rs = by[c]
+        wo = [x for x in (is_wide_open(r, lens_min) for r in rs) if x is not None]
+        ori = [r["portrait"] for r in rs if r["portrait"] is not None]
+        top_lens = Counter(r["lens"] for r in rs).most_common(1)[0]
+        rows.append((c, len(rs), pct(len(rs), len(habit)),
+                     fmt(median(r["eq_focal"] for r in rs)), fmt(median(r["eq_fnum"] for r in rs), 1),
+                     pct(sum(wo), len(wo)), fmt(median(r["iso"] for r in rs)),
+                     fmt_shutter(median(r["shutter"] for r in rs)), pct(sum(ori), len(ori)),
+                     pct(sum(rated(r) for r in rs), len(rs)), f"{top_lens[0]}（{pct(top_lens[1], len(rs))}）"))
+    lines += ["### 各类别的习惯", "",
+              table(["类别", "张数", "占比", "中位等效焦距", "中位等效光圈", "全开比例", "中位 ISO",
+                     "中位快门", "竖拍比例", "留片率(≥1星)", "最常用镜头"], rows), ""]
+
+    groups = [(c, by[c]) for c in cats if len(by[c]) >= 10]
+    if groups:
+        lines += ["### 各类别的等效焦距分布", "", "每列内部加起来是 100%，少于 10 张的类别不列。", "",
+                  crosstab("等效焦距", groups, lambda r: r["eq_focal"], FOCAL_BUCKETS), "",
+                  "### 各类别的等效光圈分布", "",
+                  crosstab("等效光圈", groups, lambda r: r["eq_fnum"], APERTURE_BUCKETS), "",
+                  "### 各类别的拍摄时段", "",
+                  crosstab("时段", groups, lambda r: r["time"].hour if r["time"] else None,
+                           [("5–8 点", rng(5, 9)), ("9–11 点", rng(9, 12)), ("12–15 点", rng(12, 16)),
+                            ("16–19 点", rng(16, 20)), ("20–4 点", lambda h: h >= 20 or h < 5)]), ""]
     return lines
 
 
@@ -451,10 +794,13 @@ def section_focal(habit):
     return lines
 
 
+APERTURE_BUCKETS = [("≤ f/1.4", rng(0, 1.5)), ("f/1.5–1.9", rng(1.5, 2.0)), ("f/2–2.7", rng(2.0, 2.8)),
+                    ("f/2.8–3.9", rng(2.8, 4.0)), ("f/4–5.5", rng(4.0, 5.6)), ("f/5.6–7.9", rng(5.6, 8.0)),
+                    ("f/8–10", rng(8.0, 11.0)), ("≥ f/11", rng(11.0, 1e9))]
+
+
 def section_aperture(habit):
-    bk = [("≤ f/1.4", rng(0, 1.5)), ("f/1.5–1.9", rng(1.5, 2.0)), ("f/2–2.7", rng(2.0, 2.8)),
-          ("f/2.8–3.9", rng(2.8, 4.0)), ("f/4–5.5", rng(4.0, 5.6)), ("f/5.6–7.9", rng(5.6, 8.0)),
-          ("f/8–10", rng(8.0, 11.0)), ("≥ f/11", rng(11.0, 1e9))]
+    bk = APERTURE_BUCKETS
     return ["## 光圈", "",
             "### 实际光圈", "", bucket_table("光圈", habit, lambda r: r["fnum"], bk), "",
             "### 等效光圈（按画幅换算后的景深与总进光）", "",
@@ -619,7 +965,7 @@ def section_35(habit):
 
 CSV_FIELDS = ["path", "body", "lens", "time", "focal", "eq_focal", "crop", "fnum", "eq_fnum", "max_ap",
               "shutter", "iso", "program", "ev", "metering", "wb", "flash", "portrait", "rating",
-              "label", "raw", "phone", "export"]
+              "label", "category", "category_src", "category_conf", "raw", "phone", "export"]
 
 
 def write_csv(path, recs):
@@ -641,6 +987,10 @@ def main():
     ap.add_argument("--include-exports", action="store_true", help="保留软件导出的 JPEG")
     ap.add_argument("--include-phones", action="store_true", help="手机照片也进入习惯分析")
     ap.add_argument("--from-cache", help="读取之前保存的 exif_cache.json，不重新扫描")
+    ap.add_argument("--content", choices=["auto", "clip", "meta"], default="auto",
+                    help="内容分类：auto 装了 CLIP 就看图；clip 必须看图；meta 只用关键词、目录名等元数据")
+    ap.add_argument("--category", action="append", choices=CATEGORY_NAMES,
+                    help="后面各节只统计这些类别，可重复，例如 --category 人像")
     a = ap.parse_args()
 
     if a.from_cache:
@@ -662,14 +1012,24 @@ def main():
     if not allrecs:
         sys.exit("没有读到带相机信息的照片。")
 
+    cache_dir = os.path.dirname(os.path.abspath(a.from_cache)) if a.from_cache else a.out
+    exiftool = a.exiftool or shutil.which("exiftool") or shutil.which("exiftool.exe")
+    clip_used = classify_content(habit, cache.get("root", ""), a.content,
+                                 os.path.join(cache_dir, "content_cache.json"), exiftool)
+
     lens_min = {}
     for r in habit:
         if r["fnum"]:
             lens_min[r["lens"]] = min(lens_min.get(r["lens"], 99), r["fnum"])
 
     lines = ["# 拍摄习惯统计", "", f"生成时间：{datetime.now():%Y-%m-%d %H:%M}", ""]
-    lines += section_overview(allrecs, habit, stats, cache.get("root", ""), a.include_phones)
+    lines += section_overview(allrecs, habit, stats, cache.get("root", ""), a.include_phones, a.category)
     lines += section_bodies(allrecs)
+    if habit:
+        lines += section_content(habit, lens_min, clip_used)
+    if a.category:
+        habit = [r for r in habit if r["category"] in a.category]
+        lines += [f"> 以下各节只统计：{'、'.join(a.category)}（{len(habit)} 张）", ""]
     if habit:
         lines += section_lenses(habit, lens_min)
         lines += section_focal(habit)
